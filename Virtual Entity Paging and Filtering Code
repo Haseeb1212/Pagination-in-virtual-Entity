@@ -1,0 +1,212 @@
+using Microsoft.Xrm.Sdk.Query;
+using Microsoft.Xrm.Sdk;
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading.Tasks;
+using System.Activities.Expressions;
+using System.Collections;
+
+namespace Virtual_Entity_Paging_Data
+{
+    public class PagingClass : IPlugin
+
+    {
+        public class Todo
+        {
+            public int Id { get; set; }
+            public string Title { get; set; }
+            public bool Completed { get; set; }
+            public bool userId { get; set; }
+
+        }
+        private static bool FilterEntity(QueryExpression query, Entity entity)
+        {
+            // If no conditions are specified, return true to include all records
+            if (!query.Criteria.Conditions.Any() && !query.Criteria.Filters.Any())
+                return true;
+
+            // Initialize a flag to track if the entity satisfies all conditions
+            bool allConditionsSatisfied = true;
+
+            // Check conditions outside of filter groups
+            foreach (var condition in query.Criteria.Conditions)
+            {
+                // Check if the entity contains the attribute specified in the condition
+                if (!entity.Contains(condition.AttributeName))
+                {
+                    // If the entity doesn't contain the attribute, it doesn't satisfy this condition
+                    allConditionsSatisfied = false;
+                    break;
+                }
+
+                // Get the value of the attribute from the entity
+                var value = entity[condition.AttributeName];
+
+                // Evaluate the condition based on its operator
+                switch (condition.Operator)
+                {
+                    case ConditionOperator.Equal:
+                        allConditionsSatisfied &= value.Equals(condition.Values[0]);
+                        break;
+                    case ConditionOperator.NotEqual:
+                        allConditionsSatisfied &= !value.Equals(condition.Values[0]);
+                        break;
+                    case ConditionOperator.Like:
+                        allConditionsSatisfied &= value.ToString().Contains(condition.Values[0].ToString().Replace("%", ""));
+                        break;
+                    // Add more cases for other ConditionOperators if needed
+                    default:
+                        // Unsupported operator
+                        allConditionsSatisfied = false;
+                        break;
+                }
+
+                // If any condition is not satisfied, break the loop
+                if (!allConditionsSatisfied)
+                    break;
+            }
+
+            // Check conditions within filter groups
+            foreach (var filter in query.Criteria.Filters)
+            {
+                bool conditionsSatisfiedInGroup = true;
+
+                // Check conditions within the current filter group
+                foreach (var condition in filter.Conditions)
+                {
+                    // Check if the entity contains the attribute specified in the condition
+                    if (!entity.Contains(condition.AttributeName))
+                    {
+                        // If the entity doesn't contain the attribute, it doesn't satisfy this condition group
+                        conditionsSatisfiedInGroup = false;
+                        break;
+                    }
+
+                    // Get the value of the attribute from the entity
+                    var value = entity[condition.AttributeName];
+
+                    // Evaluate the condition based on its operator
+                    switch (condition.Operator)
+                    {
+                        case ConditionOperator.Equal:
+                            conditionsSatisfiedInGroup &= value.Equals(condition.Values[0]);
+                            break;
+                        case ConditionOperator.NotEqual:
+                            conditionsSatisfiedInGroup &= !value.Equals(condition.Values[0]);
+                            break;
+                        case ConditionOperator.Like:
+                            conditionsSatisfiedInGroup &= value.ToString().Contains(condition.Values[0].ToString().Replace("%", ""));
+                            break;
+                        // Add more cases for other ConditionOperators if needed
+                        default:
+                            // Unsupported operator
+                            conditionsSatisfiedInGroup = false;
+                            break;
+                    }
+                }
+
+                // Update the flag indicating if all conditions in the group are satisfied
+                allConditionsSatisfied &= conditionsSatisfiedInGroup;
+
+                // If all conditions are not satisfied, break the loop
+                if (!allConditionsSatisfied)
+                    break;
+            }
+
+            // Return the final result indicating if all conditions are satisfied
+            return allConditionsSatisfied;
+        }
+        private Entity[] Sort(QueryExpression query, Entity[] data)
+        {
+            if (!query.Orders.Any()) return data;
+            var temp = data;
+            foreach (var order in query.Orders)
+            {
+                temp = order.OrderType == OrderType.Ascending
+                    ? temp.OrderBy(dt => dt.Contains(order.AttributeName) ?
+                    dt[order.AttributeName] : null).ToArray()
+                    : temp.OrderByDescending(dt => dt.Contains(order.AttributeName) ?
+                    dt[order.AttributeName] : null).ToArray();
+            }
+            return temp;
+        }
+        public void Execute(IServiceProvider serviceProvider)
+        {
+            //Preparing Organization Service for performing Dataverse operation.
+            IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+            IOrganizationServiceFactory servicefactory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+            IOrganizationService service = servicefactory.CreateOrganizationService(context.UserId);
+            ITracingService tracingService = (ITracingService)serviceProvider.GetService(typeof(ITracingService));
+            var query = (QueryExpression)context.InputParameters["Query"];
+            try
+            {
+                //Initializing EntityCollection
+                EntityCollection virtualEntityCollection = new EntityCollection();
+                //Fetching External Data From REST API 
+                var url = "https://jsonplaceholder.typicode.com/todos";
+                var httpRequest = (HttpWebRequest)WebRequest.Create(url);
+                var httpResponse = (HttpWebResponse)httpRequest.GetResponse();
+
+                using (var streamReader = new StreamReader(httpResponse.GetResponseStream()))
+                {
+                    var result = streamReader.ReadToEnd();
+                    var todos = JsonConvert.DeserializeObject<List<Todo>>(result);
+                    int totalCount = todos.Count;
+                    //Looping Through Web Service Response Data
+                    foreach (var todo in todos)
+                    {
+                        var entity = new Entity("ha_crmvirtualentityplugin")
+                        {
+                            ["ha_name"] = todo.Title,
+                            ["ha_id"] = todo.Id,
+                            ["ha_completed"] = todo.Completed,
+                            ["ha_crmvirtualentitypluginid"] = Guid.NewGuid()
+                        };
+                        // Apply filter using FilterEntity method
+                        if (FilterEntity(query, entity))
+                        {
+                            //Adding An Entity Object Into An Entity Collection
+                            virtualEntityCollection.Entities.Add(entity);
+                        }
+                       // valueCount = virtualEntityCollection.TotalRecordCount;
+                    }
+                    // Sort the virtualEntityCollection
+                    var sortedEntities = Sort(query, virtualEntityCollection.Entities.ToArray());
+                    var totalRecordPerPage = query.PageInfo.Count;
+                    var totalPage = (int)Math.Ceiling((decimal)totalCount / totalRecordPerPage);
+                    var pageInfo = string.IsNullOrEmpty(query.PageInfo.PagingCookie)
+                        ? new[] { 0, totalPage, -1 }
+                        : query.PageInfo.PagingCookie.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(e => int.Parse(e.Trim())).ToArray();
+                    var pageNumber = pageInfo[2] > -1 && pageInfo[2] != totalCount ? 0 : pageInfo[0];
+                    var pagingData = sortedEntities.Skip(totalRecordPerPage * pageNumber).Take(totalRecordPerPage).ToArray();
+                    //
+                    pageNumber += 1;
+                    query.PageInfo.PageNumber = pageNumber;
+                    query.PageInfo.PagingCookie = $"{pageNumber}/{totalPage}/{totalCount}";
+                    virtualEntityCollection = new EntityCollection(pagingData)
+                    {
+                        MoreRecords = pageNumber < totalPage,
+                        PagingCookie = query.PageInfo.PagingCookie,
+                        TotalRecordCount = totalCount
+                    };
+                 
+                }
+                //Passing The Final Entity Collection In Plug-in Output Parameter
+                context.OutputParameters["BusinessEntityCollection"] = virtualEntityCollection;
+            }
+            catch (Exception e)
+            {
+                tracingService.Trace($"{e.Message} {e.StackTrace}");
+                if (e.InnerException != null)
+                    tracingService.Trace($"{e.InnerException.Message} {e.InnerException.StackTrace}");
+                throw new InvalidPluginExecutionException(e.Message);
+            }
+        }
+    }
+}
